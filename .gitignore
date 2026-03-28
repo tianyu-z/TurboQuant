@@ -1,0 +1,10 @@
+/.pytest_cache
+/arXiv-2504.19874v1
+/paper.md
+/.worktrees/
+*.pt
+*.parquet
+*.json
+*.pyc
+__pycache__/
+docs

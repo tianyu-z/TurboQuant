@@ -1,0 +1,15 @@
+[project]
+name = "turboquant"
+version = "0.1.0"
+description = "PyTorch reference implementation of TurboQuant core algorithms"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5",
+]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["turboquant"]
