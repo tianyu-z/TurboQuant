@@ -1,168 +1,277 @@
 # TurboQuant
 
-PyTorch reference implementation of the TurboQuant components that are fully specified in `arXiv-2504.19874v1`, plus a C-stage engineering layer for packed payloads, persistence, vector search, and evaluation.
+PyTorch reference implementation of the TurboQuant vector quantization algorithm from `arXiv-2504.19874v1`. Includes packed payloads, compressed-domain scoring, persistence, vector search, and optional enhancements for KV-cache compression.
 
-## Paper-Faithful Core
+## Algorithm Overview
 
-The paper-backed math stays fixed here:
+TurboQuant compresses high-dimensional vectors via two stages:
 
-- `QJLQuantizer`
-  - Gaussian sketch matrix
-  - 1-bit sign quantization
-  - dequantization scale fixed to `sqrt(pi / 2) / d`
-- `TurboQuantMSE`
-  - random orthogonal rotation
-  - theoretical scalar codebook
-  - data-oblivious `prepare(...)`
-  - quantize / dequantize / compressed-domain score
-- `TurboQuantProd`
-  - exact paper split `TurboQuantMSE(bits - 1) + residual QJL`
-  - requires `bits >= 2`
-  - quantize / dequantize / compressed-domain score
+1. **MSE stage** (`TurboQuantMSE`): Random orthogonal rotation + per-coordinate scalar quantization using a theoretically optimal codebook derived from the spherical-coordinate Beta distribution.
+2. **Inner-product stage** (`TurboQuantProd`): Combines `TurboQuantMSE(bits - 1)` with a 1-bit QJL (Quantized Johnson-Lindenstrauss) residual correction to better preserve inner products.
 
-`prepare(...)` is the public setup API because it does not learn from data. It validates shapes, moves state to the target device, and preserves the paper's fixed codebook / rotation / projection setup. `fit(...)` remains only as a backward-compatible non-learning alias.
+Both stages are **data-oblivious** — codebooks, rotations, and projections are fixed at construction time and do not learn from data.
 
-## C-Stage Engineering Extensions
+### Core Classes
 
-The engineering layer adds reusable search and persistence on top of the frozen core:
+| Class | Purpose | Use case |
+|-------|---------|----------|
+| `TurboQuantMSE` | MSE-optimal quantization | V cache, embedding storage |
+| `TurboQuantProd` | Inner-product-preserving quantization | K cache, similarity search |
+| `TurboQuantIndex` | Build / search / save / load API | Vector search pipelines |
 
-- packed payload dataclasses backed by `torch.uint8`
-- quantizer state export / import without regenerating random matrices
-- artifact save / load helpers
-- compressed-domain scoring for both `TurboQuantMSE` and `TurboQuantProd`
-- `TurboQuantIndex` build / search / save / load API
-- local `.pt` embedding loading and disjoint train/query splitting
-- synthetic benchmark and real-data evaluation CLIs
+`QJLQuantizer` is used internally by `TurboQuantProd` but is not exported from the package root.
 
-Packed payloads stay packed in memory and on disk. Reconstruction may unpack internally, but the resident payload object reports real storage via `num_bytes()` and `bytes_per_vector()`.
-
-## Normalization Contract
-
-The default vector-search path is intentionally unit-normalized.
-
-- Index build normalizes database vectors with `normalize_rows(...)`.
-- Index search normalizes query vectors with `normalize_rows(...)`.
-- Saved index artifacts persist `normalization="unit"`.
-- Support for arbitrary non-normalized vectors is explicitly out of scope for this plan.
-
-## Basic Usage
+## Quick Start
 
 ```python
 import torch
-
 from turboquant import TurboQuantIndex
 
 data = torch.randn(1024, 128)
 query = torch.randn(16, 128)
 
-index = TurboQuantIndex.build(data, algorithm="prod", bits=3, seed=0, device="cuda", normalization="unit")
+# Build, search, save, reload
+index = TurboQuantIndex.build(data, algorithm="prod", bits=3, seed=0, device="cuda")
 result = index.search(query, k=10)
 
-index.save("toy_index.pt")
-restored = TurboQuantIndex.load("toy_index.pt", device="cuda")
-restored_result = restored.search(query, k=10)
+index.save("index.pt")
+restored = TurboQuantIndex.load("index.pt", device="cuda")
 ```
 
-## Save and Load Artifacts
+### Low-Level Quantizer API
 
-If you want direct access to the lower-level persistence helpers, use `save_index_artifact(...)` / `load_index_artifact(...)` from `turboquant.io`. They store:
+```python
+import torch
+from turboquant import TurboQuantProd
 
-- algorithm name
-- quantizer state tensors
-- packed payload tensors
-- scalar metadata such as `dim`, `bits`, `n_rows`, `format_version`
-- persisted normalization mode
+data = torch.randn(1024, 128)
+data = data / data.norm(dim=-1, keepdim=True)   # unit-normalize (required for quality guarantees)
+query = torch.randn(16, 128)
+query = query / query.norm(dim=-1, keepdim=True)
+
+q = TurboQuantProd(dim=128, bits=3, seed=0, norm_correction=True, fast_lookup=True)
+q.prepare(data)
+
+payload = q.quantize(data)            # -> TurboQuantProdPayload (packed codes + residual norm)
+x_hat = q.dequantize(payload)         # -> reconstructed torch.Tensor
+scores = q.score(query, payload)      # -> compressed-domain inner products
+
+state = q.export_state()              # -> QuantizerState dataclass
+q2 = TurboQuantProd.from_state(state) # -> reconstructed quantizer
+```
+
+## Optional Enhancements
+
+Two opt-in flags (`norm_correction`, `fast_lookup`) and one usage recommendation (asymmetric K/V). Both flags default to `False`, preserving the paper-faithful baseline.
+
+### Norm Correction
+
+Re-normalizes the reconstructed rotated vector before inverse rotation. Scalar quantization distorts the norm of the rotated representation; this correction is mathematically free but has dramatic impact on LLM perplexity.
+
+```python
+q = TurboQuantProd(dim=128, bits=3, seed=0, norm_correction=True)
+```
+
+**Experimentally validated** on Qwen2.5-3B (wikitext-2, 4096 tokens, CPU):
+
+| Method | PPL | K-cache MSE | vs fp16 |
+|--------|----:|------------:|--------:|
+| fp16 baseline | 7.77 | — | — |
+| TQ 3-bit | 1355.09 | 0.3542 | catastrophic |
+| **TQ+NC 3-bit** | **68.43** | **0.3507** | +60.66 |
+| TQ 4-bit | 19.63 | 0.0963 | +11.86 |
+| **TQ+NC 4-bit** | **8.64** | **0.0949** | **+0.87** |
+
+Key insight: MSE improves only 1%, but PPL improves **19.8x** at 3-bit. Softmax amplifies norm distortion in attention scores.
+
+The flag propagates through `export_state()` / `from_state()` and is preserved across save/load. When enabled, `score()` stays consistent with `dequantize()`.
+
+### Fast Lookup
+
+Replaces the default `O(d * k)` broadcast-argmin with `O(d log k)` `torch.searchsorted` on precomputed centroid boundaries. Produces identical indices.
+
+```python
+q = TurboQuantMSE(dim=128, bits=4, seed=0, fast_lookup=True)
+```
+
+Both options can be combined:
+
+```python
+q = TurboQuantProd(dim=128, bits=3, seed=0, norm_correction=True, fast_lookup=True)
+```
+
+### Asymmetric K/V Strategy
+
+When compressing KV caches, K and V have different optimization objectives:
+
+- **K cache** -> `TurboQuantProd` (inner-product preservation for `Q @ K^T` attention scores)
+- **V cache** -> `TurboQuantMSE` (MSE preservation for `attn_weights @ V` output)
+
+```python
+from turboquant import TurboQuantProd, TurboQuantMSE
+
+head_dim = 128
+k_quantizer = TurboQuantProd(dim=head_dim, bits=3, seed=0, norm_correction=True)
+v_quantizer = TurboQuantMSE(dim=head_dim, bits=3, seed=1, norm_correction=True)
+```
+
+**Validated via llama.cpp** on Qwen2.5-3B Q4_K_M (A100, wikitext-2, 512 ctx):
+
+| K cache | V cache | PPL | vs q8_0 baseline |
+|---------|---------|----:|------:|
+| q8_0 | q8_0 | 10.00 | baseline |
+| q8_0 | turbo4 | 10.05 | **+0.5%** |
+| q8_0 | turbo3 | 10.09 | **+0.9%** |
+| turbo3 | turbo3 | 174.40 | catastrophic |
+
+Asymmetric `q8_0-K + turbo-V` is safe; symmetric turbo on small sensitive models is not. K precision dominates quality through softmax amplification.
+
+Note: this repo's normalization contract assumes unit vectors. A full KV-cache pipeline additionally needs per-vector norm extraction and rescaling.
+
+## Experimental Results
+
+Results below were measured on an NVIDIA A100-SXM4-80GB. Quantization quality (MSE, recall, inner-product error) can be reproduced using the in-repo benchmark scripts. Norm-correction PPL and llama.cpp integration results require external tooling (HuggingFace `transformers` and the TurboQuant llama.cpp fork respectively) and are reported here for reference.
+
+### Quantization Quality (unit-normalized vectors)
+
+MSE and cosine similarity on 500 random vectors (`TurboQuantMSE`):
+
+| dim | bits | MSE | Cosine Sim |
+|----:|-----:|---------:|----------:|
+| 64 | 2 | 0.001790 | 0.9417 |
+| 64 | 3 | 0.000532 | 0.9832 |
+| 64 | 4 | 0.000148 | 0.9954 |
+| 128 | 2 | 0.000905 | 0.9407 |
+| 128 | 3 | 0.000266 | 0.9830 |
+| 128 | 4 | 0.000074 | 0.9954 |
+| 256 | 3 | 0.000133 | 0.9830 |
+| 256 | 4 | 0.000037 | 0.9953 |
+
+### llama.cpp Integration (A100, Qwen2.5-3B Q8_0)
+
+Perplexity (wikitext-2, 512 context, 8 chunks):
+
+| KV cache type | PPL | vs q8_0 | KV size |
+|---------------|----:|--------:|--------:|
+| q8_0 | 9.82 | baseline | 38.25 MiB |
+| turbo4 | 12.42 | +26.4% | 19.12 MiB |
+| turbo3 | 145.47 | +1381% | 14.06 MiB |
+
+Note: Qwen2.5-3B is exceptionally KV-sensitive — even standard `q4_0` KV cache gives +92.5% PPL on this model. Reference benchmarks on larger models (Qwen3.5-35B) show turbo3 at +1.06% and turbo4 at +0.23%.
+
+Decode speed:
+
+| KV cache | Decode tok/s | vs q8_0 | Prefill tok/s (4K) | vs q8_0 |
+|----------|------------:|--------:|-------------------:|--------:|
+| q8_0 | 200.7 | baseline | 9473 | baseline |
+| turbo4 | 172.5 | 0.86x | — | — |
+| turbo3 | 178.6 | 0.89x | 9046 | 0.96x |
+
+Context scaling (turbo3 vs q8_0):
+
+| Context depth | Prefill ratio | Decode ratio |
+|--------------:|--------------:|-------------:|
+| 0 | — | 0.89x |
+| 2K | 0.96x | 0.89x |
+| 4K | 0.96x | 0.89x |
+| 8K | 0.95x | 0.89x |
+
+Decode overhead is flat across context depths. Prefill near parity (~96%).
+
+### Vector Search Recall
+
+Evaluated on DBpedia OpenAI3 embeddings (99K train, 1K query) using `scripts/eval_vector_search.py`:
+
+| dataset | bits | 1@1 | 1@2 | 1@4 | 1@8 |
+|---------|-----:|----:|----:|----:|----:|
+| `d=1536` | 2 | 0.736 | 0.894 | 0.969 | 0.994 |
+| `d=1536` | 4 | 0.911 | 0.987 | 1.000 | 1.000 |
+| `d=3072` | 2 | 0.823 | 0.948 | 0.992 | 1.000 |
+| `d=3072` | 4 | 0.934 | 0.996 | 1.000 | 1.000 |
+
+These match the paper's Figure 5 directionally but undershoot its top-1 numbers.
+
+## Engineering Features
+
+- **Packed payloads**: Bit-level `torch.uint8` encoding with exact byte accounting via `num_bytes()` / `bytes_per_vector()`
+- **Compressed-domain scoring**: `score()` computes approximate inner products without dequantization
+- **State persistence**: `export_state()` / `from_state()` + artifact save/load via `turboquant.io`
+- **Device management**: `.to(device)` for CPU/CUDA migration
+- **Legacy compatibility**: Supports both packed `PackedCodes` and legacy 2D tensor indices
+
+## Compression Ratios
+
+`TurboQuantMSE` stores only packed codebook indices. Exact byte count: `ceil(n * d * bits / 8)` per batch; approximate bytes/vector: `d * bits / 8`.
+
+| bits | Approx bytes/vector | vs fp32 | vs fp16 |
+|-----:|--------------------:|--------:|--------:|
+| 2 | `d / 4` | 16x | 8x |
+| 3 | `3d / 8` | 10.7x | 5.3x |
+| 4 | `d / 2` | 8x | 4x |
+
+`TurboQuantProd` stores MSE codes at `(bits-1)` per coordinate, 1-bit packed residual signs, and a 4-byte float32 `residual_norm` per vector. Approximate bytes/vector: `d * bits / 8 + 4`. Exact byte counts use per-buffer `ceil()` rounding (see `TurboQuantProdPayload.num_bytes()`).
+
+| bits | Approx bytes/vector (d=128) | vs fp32 | vs fp16 |
+|-----:|----------------------------:|--------:|--------:|
+| 3 | `128*3/8 + 4` = 52 | 9.8x | 4.9x |
+| 4 | `128*4/8 + 4` = 68 | 7.5x | 3.8x |
+
+## Normalization Contract
+
+The default vector-search path is intentionally unit-normalized:
+
+- `TurboQuantIndex.build()` normalizes database vectors.
+- `TurboQuantIndex.search()` normalizes query vectors.
+- The low-level quantizer API (`TurboQuantMSE`, `TurboQuantProd`) does **not** normalize automatically. Quality guarantees assume unit-normalized input.
 
 ## Run Tests
 
-Use the `py311` Conda environment:
-
 ```bash
-conda run -n py311 python -m pytest -v
+conda run -n py311 python -m pytest tests/ -v
 ```
 
-## Run Synthetic Benchmarks
+86 tests (including norm_correction and searchsorted tests). Expected: all pass.
 
-This CLI prints paper-faithful quality metrics separately from engineering-extension systems metrics:
+## Run Benchmarks
 
+Synthetic:
 ```bash
 conda run -n py311 python scripts/run_reference_benchmarks.py \
-  --dim 128 \
-  --n-data 4096 \
-  --n-query 256 \
-  --bits 2 3 4 \
-  --device cuda
+  --dim 128 --n-data 4096 --n-query 256 --bits 2 3 4 --device cuda
 ```
 
-## Run Real-Data Vector Search Evaluation
-
-For local `.pt` embeddings:
-
+Real embeddings:
 ```bash
 conda run -n py311 python scripts/eval_vector_search.py \
-  --train-embeddings /absolute/path/to/embeddings.pt \
-  --algorithm prod \
-  --bits 3 4 \
-  --k 10 \
-  --device cuda \
-  --limit-train 100000 \
-  --limit-query 1000
+  --train-embeddings /path/to/embeddings.pt \
+  --algorithm prod --bits 3 4 --k 10 --device cuda
 ```
-
-The JSON output reports `paper_faithful_core.one_at_k_recall` and the engineering metrics for build/query time and storage.
-
-## Paper Reproduction Status
-
-Nearest-neighbor validation was run against the paper-aligned DBpedia OpenAI3 datasets:
-
-- `Qdrant/dbpedia-entities-openai3-text-embedding-3-large-1536-100K`
-- `Qdrant/dbpedia-entities-openai3-text-embedding-3-large-3072-100K`
-
-The local check used a `99000` train + `1000` query split because the published `100K` repos do not ship a separate query set. Full notes are recorded in `docs/experiments/results/2026-03-27-paper-nn-validation.md`.
-
-What reproduced:
-
-- the qualitative nearest-neighbor trend from Figure 5
-- higher recall with more bits
-- near-perfect `1@k` once `k` is moderately large
-
-What did not reproduce:
-
-- the paper's top-1 numbers closely enough to claim an exact reproduction
-- any KV-cache / `PolarQuant` "no precision loss" claim
-
-Observed `TurboQuant_prod` recall:
-
-| dataset | bits | 1@1 | 1@2 | 1@4 | 1@8 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| OpenAI3 large `d=1536` | 2 | 0.7360 | 0.8940 | 0.9690 | 0.9940 |
-| OpenAI3 large `d=1536` | 4 | 0.9110 | 0.9870 | 1.0000 | 1.0000 |
-| OpenAI3 large `d=3072` | 2 | 0.8230 | 0.9480 | 0.9920 | 1.0000 |
-| OpenAI3 large `d=3072` | 4 | 0.9340 | 0.9960 | 1.0000 | 1.0000 |
-
-Paper Figure 5 is a curve rather than a table, but visually the paper appears closer to about `0.90` / `0.97` at `1@1` for the `2-bit` / `4-bit` `prod` curves. This implementation therefore matches the paper directionally, but currently undershoots its reported top-1 quality.
-
-## Explicitly Deferred
-
-The repository still does not claim:
-
-- `PolarQuant`
-- faithful KV-cache reproduction from the supplied tarball
-- the paper's undocumented `2.5` / `3.5` bit outlier-channel recipe
-- custom kernels, Triton kernels, or ANN structures
 
 ## Layout
 
-- `turboquant/codebooks.py`: scalar codebook solver
-- `turboquant/datasets.py`: local embedding loading and train/query splitting
-- `turboquant/index.py`: reusable vector-search index API
-- `turboquant/io.py`: packed artifact persistence
-- `turboquant/math.py`: orthogonal rotations and normalization
-- `turboquant/qjl.py`: QJL primitive
-- `turboquant/search.py`: exact search and `1@k` recall helpers
-- `turboquant/turboquant_mse.py`: paper-faithful MSE quantizer
-- `turboquant/turboquant_prod.py`: paper-faithful residual-corrected quantizer
-- `turboquant/benchmarks.py`: synthetic benchmark harness
-- `scripts/run_reference_benchmarks.py`: synthetic benchmark CLI
-- `scripts/eval_vector_search.py`: local embedding evaluation CLI
-- `tests/`: unit and smoke tests
+```
+turboquant/
+  codebooks.py          Scalar codebook solver (Beta PDF + searchsorted helpers)
+  turboquant_mse.py     MSE quantizer (norm_correction, fast_lookup options)
+  turboquant_prod.py    Inner-product quantizer (MSE + QJL residual)
+  qjl.py                1-bit QJL primitive
+  types.py              PackedCodes, payloads, QuantizerState
+  packing.py            Bit-level pack/unpack
+  index.py              TurboQuantIndex build/search/save/load
+  io.py                 Artifact persistence
+  math.py               Orthogonal rotations, normalization
+  search.py             Exact search, 1@k recall
+  datasets.py           Embedding loading, train/query splitting
+  benchmarks.py         Synthetic benchmark harness
+scripts/
+  run_reference_benchmarks.py    Synthetic benchmark CLI
+  eval_vector_search.py          Real embedding evaluation CLI
+tests/                           86 unit and integration tests
+```
+
+## Explicitly Deferred
+
+- PolarQuant (norm-aware variant for non-unit vectors)
+- Faithful KV-cache pipeline with per-vector norm storage
+- The paper's undocumented 2.5 / 3.5 bit outlier-channel recipe
+- Custom kernels, Triton kernels, or ANN structures

@@ -39,6 +39,8 @@ def _serialize_state(state: QuantizerState) -> dict[str, object]:
         "rotation": state.rotation,
         "projection": state.projection,
         "scale": state.scale,
+        "norm_correction": state.norm_correction,
+        "fast_lookup": state.fast_lookup,
         "format_version": state.format_version,
     }
 
@@ -52,6 +54,8 @@ def _deserialize_state(serialized: dict[str, object]) -> QuantizerState:
         rotation=serialized.get("rotation"),
         projection=serialized.get("projection"),
         scale=serialized.get("scale"),
+        norm_correction=bool(serialized.get("norm_correction", False)),
+        fast_lookup=bool(serialized.get("fast_lookup", False)),
         format_version=int(serialized.get("format_version", FORMAT_VERSION)),
     )
 

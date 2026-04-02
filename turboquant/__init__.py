@@ -1,3 +1,4 @@
+from turboquant.codebooks import centroid_boundaries, searchsorted_quantize
 from turboquant.datasets import load_embeddings_pt, make_train_query_split
 from turboquant.index import TurboQuantIndex
 from turboquant.packing import pack_codes, pack_signs, unpack_codes, unpack_signs
@@ -9,6 +10,7 @@ from turboquant.types import PackedCodes, SearchResult, TurboQuantMSEPayload, Tu
 
 
 __all__ = [
+    "centroid_boundaries",
     "load_embeddings_pt",
     "make_train_query_split",
     "TurboQuantIndex",
@@ -22,6 +24,7 @@ __all__ = [
     "one_at_k_recall",
     "pack_codes",
     "pack_signs",
+    "searchsorted_quantize",
     "unpack_codes",
     "unpack_signs",
     "make_random_orthogonal_matrix",

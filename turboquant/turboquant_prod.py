@@ -15,14 +15,21 @@ class TurboQuantProd:
         bits: int,
         seed: int | None = None,
         device: torch.device | str | None = None,
+        norm_correction: bool = False,
+        fast_lookup: bool = False,
     ) -> None:
         if bits < 2:
             raise ValueError("bits must be >= 2")
 
         self.dim = dim
         self.bits = bits
+        self.norm_correction = norm_correction
+        self.fast_lookup = fast_lookup
         self.device = torch.device(device) if device is not None else torch.device("cpu")
-        self.mse_quantizer = TurboQuantMSE(dim=dim, bits=bits - 1, seed=seed, device=self.device)
+        self.mse_quantizer = TurboQuantMSE(
+            dim=dim, bits=bits - 1, seed=seed, device=self.device,
+            norm_correction=norm_correction, fast_lookup=fast_lookup,
+        )
         self.qjl_quantizer = QJLQuantizer(dim=dim, seed=seed, device=self.device)
 
     def to(self, device: torch.device | str) -> "TurboQuantProd":
@@ -111,6 +118,8 @@ class TurboQuantProd:
             rotation=self.mse_quantizer.rotation.detach().clone(),
             projection=self.qjl_quantizer.projection.detach().clone(),
             scale=float(self.qjl_quantizer.scale),
+            norm_correction=self.norm_correction,
+            fast_lookup=self.fast_lookup,
             format_version=1,
         )
 
@@ -120,10 +129,16 @@ class TurboQuantProd:
             raise ValueError(f"expected turboquant_prod state, got {state.kind}")
         if state.codebook is None or state.rotation is None or state.projection is None or state.scale is None:
             raise ValueError("TurboQuantProd state must include codebook, rotation, projection, and scale")
-        quantizer = cls(dim=state.dim, bits=state.bits, device=state.codebook.device)
+        quantizer = cls(
+            dim=state.dim, bits=state.bits, device=state.codebook.device,
+            norm_correction=state.norm_correction, fast_lookup=state.fast_lookup,
+        )
         quantizer.mse_quantizer.codebook = state.codebook.detach().clone()
         quantizer.mse_quantizer.rotation = state.rotation.detach().clone()
         quantizer.qjl_quantizer.projection = state.projection.detach().clone()
         quantizer.qjl_quantizer.scale = float(state.scale)
         quantizer.device = quantizer.mse_quantizer.codebook.device
+        if quantizer.fast_lookup:
+            from turboquant.codebooks import centroid_boundaries
+            quantizer.mse_quantizer._boundaries = centroid_boundaries(quantizer.mse_quantizer.codebook)
         return quantizer

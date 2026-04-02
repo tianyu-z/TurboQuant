@@ -85,3 +85,21 @@ def solve_beta_codebook(dim: int, bits: int, steps: int = 64, n_grid: int = 3276
     pdf = turbo_coordinate_pdf(grid, dim)
     centroids = _weighted_lloyd_max(grid=grid, pdf=pdf, k=2**bits, steps=steps)
     return torch.sort(centroids).values
+
+
+def centroid_boundaries(codebook: torch.Tensor) -> torch.Tensor:
+    """Compute decision boundaries as midpoints between sorted centroids.
+
+    Returns a 1D tensor of length ``len(codebook) - 1`` suitable for use
+    with :func:`torch.searchsorted`.
+    """
+    return 0.5 * (codebook[:-1] + codebook[1:])
+
+
+def searchsorted_quantize(values: torch.Tensor, boundaries: torch.Tensor) -> torch.Tensor:
+    """Quantize each element of *values* to the nearest centroid index.
+
+    Uses :func:`torch.searchsorted` on pre-computed *boundaries* for
+    ``O(d log k)`` lookup instead of the default ``O(d * k)`` broadcast.
+    """
+    return torch.searchsorted(boundaries, values)

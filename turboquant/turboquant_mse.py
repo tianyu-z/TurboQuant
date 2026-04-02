@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from turboquant.codebooks import solve_beta_codebook
+from turboquant.codebooks import centroid_boundaries, searchsorted_quantize, solve_beta_codebook
 from turboquant.math import _canonical_device, make_random_orthogonal_matrix
 from turboquant.packing import pack_codes, unpack_codes
 from turboquant.types import QuantizerState, TurboQuantMSEPayload
@@ -17,17 +17,26 @@ class TurboQuantMSE:
         bits: int,
         seed: int | None = None,
         device: torch.device | str | None = None,
+        norm_correction: bool = False,
+        fast_lookup: bool = False,
     ) -> None:
         self.dim = dim
         self.bits = bits
+        self.norm_correction = norm_correction
+        self.fast_lookup = fast_lookup
         self.device = _canonical_device(device)
         self.rotation = make_random_orthogonal_matrix(dim=dim, seed=seed, device=self.device)
         self.codebook = solve_beta_codebook(dim=dim, bits=bits).to(self.device)
+        self._boundaries: torch.Tensor | None = None
+        if self.fast_lookup:
+            self._boundaries = centroid_boundaries(self.codebook)
 
     def to(self, device: torch.device | str) -> "TurboQuantMSE":
         self.device = _canonical_device(device)
         self.rotation = self.rotation.to(self.device)
         self.codebook = self.codebook.to(self.device)
+        if self._boundaries is not None:
+            self._boundaries = self._boundaries.to(self.device)
         return self
 
     def prepare(self, x: torch.Tensor | None = None) -> "TurboQuantMSE":
@@ -47,8 +56,11 @@ class TurboQuantMSE:
         if x.device != self.device:
             self.to(x.device)
         y = x @ self.rotation.T
-        distances = torch.abs(y.unsqueeze(-1) - self.codebook.view(1, 1, -1))
-        indices = torch.argmin(distances, dim=-1)
+        if self.fast_lookup and self._boundaries is not None:
+            indices = searchsorted_quantize(y, self._boundaries)
+        else:
+            distances = torch.abs(y.unsqueeze(-1) - self.codebook.view(1, 1, -1))
+            indices = torch.argmin(distances, dim=-1)
         return TurboQuantMSEPayload(codes=pack_codes(indices, bits=self.bits))
 
     def _decode_indices(self, payload: TurboQuantMSEPayload) -> torch.Tensor:
@@ -110,6 +122,9 @@ class TurboQuantMSE:
     def dequantize(self, payload: TurboQuantMSEPayload) -> torch.Tensor:
         indices = self._decode_indices(payload)
         y_hat = self.codebook[indices]
+        if self.norm_correction:
+            y_hat_norms = torch.linalg.norm(y_hat, dim=-1, keepdim=True)
+            y_hat = y_hat / torch.clamp(y_hat_norms, min=1e-12)
         return y_hat @ self.rotation
 
     def score(self, query: torch.Tensor, payload: TurboQuantMSEPayload) -> torch.Tensor:
@@ -132,6 +147,9 @@ class TurboQuantMSE:
                 assert legacy_indices is not None
                 chunk_indices = legacy_indices[start:end]
             chunk_y_hat = self.codebook[chunk_indices]
+            if self.norm_correction:
+                chunk_norms = torch.linalg.norm(chunk_y_hat, dim=-1, keepdim=True)
+                chunk_y_hat = chunk_y_hat / torch.clamp(chunk_norms, min=1e-12)
             scores[:, start:end] = q_rot @ chunk_y_hat.T
         return scores
 
@@ -142,6 +160,8 @@ class TurboQuantMSE:
             bits=self.bits,
             codebook=self.codebook.detach().clone(),
             rotation=self.rotation.detach().clone(),
+            norm_correction=self.norm_correction,
+            fast_lookup=self.fast_lookup,
             format_version=1,
         )
 
@@ -151,8 +171,16 @@ class TurboQuantMSE:
             raise ValueError(f"expected turboquant_mse state, got {state.kind}")
         if state.codebook is None or state.rotation is None:
             raise ValueError("TurboQuantMSE state must include codebook and rotation tensors")
-        quantizer = cls(dim=state.dim, bits=state.bits, device=state.codebook.device)
+        quantizer = cls(
+            dim=state.dim,
+            bits=state.bits,
+            device=state.codebook.device,
+            norm_correction=state.norm_correction,
+            fast_lookup=state.fast_lookup,
+        )
         quantizer.codebook = state.codebook.detach().clone()
         quantizer.rotation = state.rotation.detach().clone()
         quantizer.device = quantizer.codebook.device
+        if quantizer.fast_lookup:
+            quantizer._boundaries = centroid_boundaries(quantizer.codebook)
         return quantizer

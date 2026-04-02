@@ -129,6 +129,8 @@ class QuantizerState:
     rotation: torch.Tensor | None = None
     projection: torch.Tensor | None = None
     scale: float | None = None
+    norm_correction: bool = False
+    fast_lookup: bool = False
     format_version: int = 1
 
 
